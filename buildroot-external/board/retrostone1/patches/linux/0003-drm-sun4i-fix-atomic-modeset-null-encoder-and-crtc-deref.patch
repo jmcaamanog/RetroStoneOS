@@ -1,0 +1,237 @@
+From 1234567890abcdef1234567890abcdef12345678 Mon Sep 17 00:00:00 2001
+From: Jose Manuel Caamano <5682292+jmcaamanog@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:30:00 +02:00
+Subject: [PATCH] drm/sun4i: fix atomic modeset NULL encoder and CRTC dereference
+
+In atomic DRM commits, the legacy encoder->crtc pointer is not updated
+until drm_atomic_helper_commit_hw_done() / update_legacy_modeset_state(),
+which runs after commit_modeset_enables(). Consequently, during the initial
+modeset on a cold boot (such as enabling the TV encoder for Composite-1 or
+enabling HDMI when booting without a cable), encoder->crtc is NULL.
+
+Previously:
+1. sun4i_crtc_get_encoder() only searched for encoder->crtc == crtc,
+   returning NULL on first boot atomic enable.
+2. sun4i_tcon_mode_set() and sun4i_tcon_set_status() immediately
+   dereferenced encoder->encoder_type, triggering a fatal kernel NULL
+   pointer dereference and kernel panic.
+3. sun4i_tcon_set_mux() dereferenced encoder->crtc->name in a DRM_DEBUG
+   print, causing a NULL pointer dereference.
+4. sun4i_tv_enable() and sun4i_tv_disable() retrieved the CRTC from
+   encoder->crtc instead of the active connector state, causing
+   crtc_state and crtc to be NULL, leading to a kernel panic when
+   accessing crtc_state->mode or crtc->engine.
+
+Fix all four issues by:
+- In sun4i_crtc_get_encoder(): iterate active connectors in the device
+  to find the connector driving this CRTC, falling back to possible_crtcs.
+- In sun4i_tcon_set_mux(): guard encoder and check encoder->crtc before
+  printing crtc->name.
+- In sun4i_tcon_mode_set() and sun4i_tcon_set_status(): handle encoder == NULL
+  safely without dereferencing encoder_type.
+- In sun4i_tv_enable() and sun4i_tv_disable(): retrieve crtc from
+  conn_state->crtc with fallback to encoder->crtc, and guard crtc->engine.
+
+Signed-off-by: Jose Manuel Caamano <5682292+jmcaamanog@users.noreply.github.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_crtc.c | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun4i_tcon.c | 30 ++++++++++++++++++++----------
+ drivers/gpu/drm/sun4i/sun4i_tv.c   | 31 +++++++++++++++++++++++++------
+ 3 files changed, 69 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index 18e7404..f61bdd9 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -17,6 +17,7 @@
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
++#include <drm/drm_connector.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_print.h>
+@@ -36,12 +37,35 @@
+  */
+ static struct drm_encoder *sun4i_crtc_get_encoder(struct drm_crtc *crtc)
+ {
++	struct drm_connector *connector;
++	struct drm_connector_list_iter conn_iter;
+ 	struct drm_encoder *encoder;
+ 
++	/* 1. Legacy or already active encoder */
+ 	drm_for_each_encoder(encoder, crtc->dev)
+ 		if (encoder->crtc == crtc)
+ 			return encoder;
+ 
++	/* 2. In atomic commit, find connector whose state points to crtc */
++	drm_connector_list_iter_begin(crtc->dev, &conn_iter);
++	drm_for_each_connector_iter(connector, &conn_iter) {
++		if (connector->state && connector->state->crtc == crtc) {
++			encoder = connector->state->best_encoder ?
++				  connector->state->best_encoder : connector->encoder;
++			if (encoder) {
++				drm_connector_list_iter_end(&conn_iter);
++				return encoder;
++			}
++		}
++	}
++	drm_connector_list_iter_end(&conn_iter);
++
++	/* 3. Hardware topology: find encoder whose possible_crtcs includes this CRTC */
++	drm_for_each_encoder(encoder, crtc->dev) {
++		if (encoder->possible_crtcs & drm_crtc_mask(crtc))
++			return encoder;
++	}
++
+ 	return NULL;
+ }
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index 960e83c..28921c7 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -193,21 +193,25 @@ void sun4i_tcon_set_status(struct sun4i_tcon *tcon,
+ 	bool is_lvds = false;
+ 	int channel;
+ 
+-	switch (encoder->encoder_type) {
+-	case DRM_MODE_ENCODER_LVDS:
+-		is_lvds = true;
+-		fallthrough;
+-	case DRM_MODE_ENCODER_DSI:
+-	case DRM_MODE_ENCODER_NONE:
+-		channel = 0;
+-		break;
+-	case DRM_MODE_ENCODER_TMDS:
+-	case DRM_MODE_ENCODER_TVDAC:
+-		channel = 1;
+-		break;
+-	default:
+-		DRM_DEBUG_DRIVER("Unknown encoder type, doing nothing...\n");
+-		return;
++	if (!encoder) {
++		channel = tcon->quirks->has_channel_1 ? 1 : 0;
++	} else {
++		switch (encoder->encoder_type) {
++		case DRM_MODE_ENCODER_LVDS:
++			is_lvds = true;
++			fallthrough;
++		case DRM_MODE_ENCODER_DSI:
++		case DRM_MODE_ENCODER_NONE:
++			channel = 0;
++			break;
++		case DRM_MODE_ENCODER_TMDS:
++		case DRM_MODE_ENCODER_TVDAC:
++			channel = 1;
++			break;
++		default:
++			DRM_DEBUG_DRIVER("Unknown encoder type, doing nothing...\n");
++			return;
++		}
+ 	}
+ 
+ 	if (is_lvds && !enabled)
+@@ -266,11 +270,15 @@ static void sun4i_tcon_set_mux(struct sun4i_tcon *tcon, int channel,
+ {
+ 	int ret = -ENOTSUPP;
+ 
++	if (!encoder)
++		return;
++
+ 	if (tcon->quirks->set_mux)
+ 		ret = tcon->quirks->set_mux(tcon, encoder);
+ 
+ 	DRM_DEBUG_DRIVER("Muxing encoder %s to CRTC %s: %d\n",
+-			 encoder->name, encoder->crtc->name, ret);
++			 encoder->name,
++			 encoder->crtc ? encoder->crtc->name : "(unassigned)", ret);
+ }
+ 
+ static int sun4i_tcon_get_clk_delay(const struct drm_display_mode *mode,
+@@ -713,6 +721,12 @@ void sun4i_tcon_mode_set(struct sun4i_tcon *tcon,
+ 			 const struct drm_encoder *encoder,
+ 			 const struct drm_display_mode *mode)
+ {
++	if (!encoder) {
++		if (tcon->quirks->has_channel_1)
++			sun4i_tcon1_mode_set(tcon, mode);
++		return;
++	}
++
+ 	switch (encoder->encoder_type) {
+ 	case DRM_MODE_ENCODER_DSI:
+ 		/* DSI is tied to special case of CPU interface */
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tv.c b/drivers/gpu/drm/sun4i/sun4i_tv.c
+index 07c60d7..d17a5c1 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tv.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tv.c
+@@ -275,7 +275,10 @@ static void sun4i_tv_disable(struct drm_encoder *encoder,
+ 			    struct drm_atomic_state *state)
+ {
+ 	struct sun4i_tv *tv = drm_encoder_to_sun4i_tv(encoder);
+-	struct sun4i_crtc *crtc = drm_crtc_to_sun4i_crtc(encoder->crtc);
++	struct drm_connector *connector = &tv->connector;
++	struct drm_connector_state *conn_state =
++		state ? drm_atomic_get_new_connector_state(state, connector) : NULL;
++	struct drm_crtc *drm_crtc = conn_state ? conn_state->crtc : encoder->crtc;
+ 
+ 	DRM_DEBUG_DRIVER("Disabling the TV Output\n");
+ 
+@@ -283,22 +286,39 @@ static void sun4i_tv_disable(struct drm_encoder *encoder,
+ 			   SUN4I_TVE_EN_ENABLE,
+ 			   0);
+ 
+-	sunxi_engine_disable_color_correction(crtc->engine);
++	if (drm_crtc) {
++		struct sun4i_crtc *crtc = drm_crtc_to_sun4i_crtc(drm_crtc);
++
++		if (crtc && crtc->engine)
++			sunxi_engine_disable_color_correction(crtc->engine);
++	}
+ }
+ 
+ static void sun4i_tv_enable(struct drm_encoder *encoder,
+ 			    struct drm_atomic_state *state)
+ {
+ 	struct sun4i_tv *tv = drm_encoder_to_sun4i_tv(encoder);
+-	struct sun4i_crtc *crtc = drm_crtc_to_sun4i_crtc(encoder->crtc);
+-	struct drm_crtc_state *crtc_state =
+-		drm_atomic_get_new_crtc_state(state, encoder->crtc);
+-	struct drm_display_mode *mode = &crtc_state->mode;
+ 	struct drm_connector *connector = &tv->connector;
+ 	struct drm_connector_state *conn_state =
+ 		drm_atomic_get_new_connector_state(state, connector);
+-	const struct tv_mode *tv_mode =
+-		sun4i_tv_find_tv_by_mode(conn_state->tv.mode);
++	struct drm_crtc *drm_crtc = conn_state ? conn_state->crtc : encoder->crtc;
++	struct sun4i_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	struct drm_display_mode *mode;
++	const struct tv_mode *tv_mode;
++
++	if (!drm_crtc)
++		return;
++
++	crtc = drm_crtc_to_sun4i_crtc(drm_crtc);
++	crtc_state = state ? drm_atomic_get_new_crtc_state(state, drm_crtc) : NULL;
++	if (!crtc_state)
++		return;
++
++	mode = &crtc_state->mode;
++	tv_mode = sun4i_tv_find_tv_by_mode(conn_state ? conn_state->tv.mode : DRM_MODE_TV_MODE_NTSC);
++	if (!tv_mode)
++		tv_mode = &tv_modes[0];
+ 
+ 	DRM_DEBUG_DRIVER("Enabling the TV Output\n");
+ 
+@@ -395,7 +415,8 @@ static void sun4i_tv_enable(struct drm_encoder *encoder,
+ 
+ 	regmap_write(tv->regs, SUN4I_TVE_SLAVE_REG, 0);
+ 
+-	sunxi_engine_apply_color_correction(crtc->engine);
++	if (crtc && crtc->engine)
++		sunxi_engine_apply_color_correction(crtc->engine);
+ 
+ 	regmap_update_bits(tv->regs, SUN4I_TVE_EN_REG,
+ 			   SUN4I_TVE_EN_ENABLE,

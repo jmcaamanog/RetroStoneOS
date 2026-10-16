@@ -104,11 +104,20 @@ UART without the menu.
 
 1. **The built-in screen** (kernel patch 0002 + the composite support of the frontend):
    - [x] **1. Probe.** `dmesg | grep -i -e tv -e mixer -e tcon -e drm`: sun4i-drm binds cleanly; `Composite-1` and `HDMI-A-1` are recognized. Missing `&mixer1` node in DTS fixed in commit `4e6bd91`.
-   - [ ] **2. Menu at boot on the panel** (no HDMI cable): Currently hangs early before the menu starts, causing the hardware watchdog to reset the board approximately every 15 s (black, then a 1s blue flash, then black). This behavior reproduces identically on PCB v1.3 and v1.40 even with `internal_display = none`, pointing to an early SoC/kernel hang when HDMI is not attached.
+   - [ ] **2. Menu at boot on the panel** (no HDMI cable): Fix implemented in kernel patch 0003 (`0003-drm-sun4i-fix-atomic-modeset-null-encoder-and-crtc-deref.patch`). Root cause: in DRM atomic commits, legacy `encoder->crtc` is unpopulated until `drm_atomic_helper_commit_hw_done()`. On cold boot without HDMI, `sun4i_crtc_get_encoder()` returned NULL, triggering a NULL pointer dereference in `sun4i_tcon_mode_set()`, `sun4i_tcon_set_status()`, `sun4i_tcon_set_mux()`, and `sun4i_tv.c` (`sun4i_tv_enable()`). Patch 0003 resolves the encoder from active connector states and safeguards all pointers.
    - [x] **3. NTSC vs PAL.** Tested on hardware. `tv_norm = ntsc` (60 Hz) is strictly required: the AMT630A converter cannot lock onto 50 Hz PAL timings, cycling in a 1-second white screen / blue "No Signal" flash. Explicit NTSC is now guarded against PAL fallback in `frontend/src/display.c`.
    - [ ] **4. Switching.** Plug/unplug HDMI hotplug latency and transitions.
    - [ ] **5. Picture position and overscan.** AMT630A OSD position and `tv_overscan` margin settings on the panel.
    - [ ] **6. Game planes.** VI plane scaling and OSD counter overlay verification on mixer 1.
+
+   **Cold boot atomic modeset freeze cause and fix (patch 0003):**
+   When booting in portable mode without HDMI, user space initiates an atomic modeset on `Composite-1`. Because
+   no previous legacy display initialization ran, `encoder->crtc` is `NULL`. `sun4i_crtc_get_encoder()` returned `NULL`,
+   and `sun4i_tcon_mode_set()` / `sun4i_tcon_set_status()` immediately dereferenced `encoder->encoder_type`.
+   Simultaneously, `sun4i_tcon_set_mux()` dereferenced `encoder->crtc->name`, and `sun4i_tv_enable()` dereferenced
+   `encoder->crtc`. The resulting kernel panic halted the CPU, stopping the user space watchdog keeper, causing
+   the Allwinner H3 hardware watchdog (16 s) to trigger an infinite reboot loop. Kernel patch 0003 resolves the encoder
+   via `drm_connector_iter` matching `connector->state->crtc == crtc` and protects all dereferences.
 
    **Green screen cause and fix (DCSC latch):**
    In Allwinner DE2, mixer and color space conversion (DCSC) registers are shadow registers with double buffering.

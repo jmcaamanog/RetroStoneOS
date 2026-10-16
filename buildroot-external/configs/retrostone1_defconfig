@@ -24,8 +24,8 @@ BR2_ARM_FPU_NEON_VFPV4=y
 BR2_DL_DIR="$(HOME)/rsos/dl"
 BR2_CCACHE=y
 # The hashes of the custom Linux and U-Boot versions (linux/linux.hash,
-# uboot/uboot.hash), the exFAT read-ahead patch (the RetroStone2's 0004) and the
-# H3 TV encoder (0002, the built-in screen)
+# uboot/uboot.hash), the exFAT read-ahead patch (the RetroStone2's 0004), the
+# H3 TV encoder (0002) and atomic modeset NULL deref fix (0003)
 BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_RETROSTONE_PATH)/board/retrostone1/patches"
 BR2_DOWNLOAD_FORCE_CHECK_HASHES=y
 
